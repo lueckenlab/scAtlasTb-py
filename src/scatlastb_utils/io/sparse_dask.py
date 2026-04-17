@@ -77,6 +77,11 @@ def sparse_dataset_as_dask(x, stride: int = 1000):
     """Convert a sparse dataset to a dask array with specified chunk size."""
     if not isinstance(x, CSRDataset | CSCDataset | da.Array):
         return x
+
+    # Validate stride parameter to avoid ZeroDivisionError
+    if stride <= 0:
+        raise ValueError(f"stride must be a positive integer, got {stride}")
+
     n_chunks, rem = divmod(x.shape[0], stride)
 
     chunks = []

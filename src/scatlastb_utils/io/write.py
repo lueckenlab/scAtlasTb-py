@@ -7,9 +7,8 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import pandas as pd
-from dask import array as da
 
-from scatlastb_utils.pipeline.misc import dask_compute
+from scatlastb_utils.utils import dask_compute, ensure_sparse
 
 from .config import ALL_SLOTS, print_flushed
 from .subset_slots import set_mask_per_slot
@@ -28,17 +27,8 @@ def write_zarr(adata: ad.AnnData, file: str | Path, compute: bool = False) -> No
     compute
         Whether to compute dask arrays before writing. Default is False.
     """
-
-    def sparse_coo_to_csr(matrix):
-        import sparse
-
-        if isinstance(matrix, da.Array) and isinstance(matrix._meta, sparse.COO):
-            matrix = matrix.map_blocks(lambda x: x.tocsr(), dtype=matrix.dtype)
-        return matrix
-
-    adata.X = sparse_coo_to_csr(adata.X)
-    for layer in adata.layers:
-        adata.layers[layer] = sparse_coo_to_csr(adata.layers[layer])
+    # Ensure matrices are in a sparse CSR/CSC representation accepted by the zarr writer
+    adata = ensure_sparse(adata)
 
     # fix dtype for NaN obs columns
     for col in adata.obs.columns:

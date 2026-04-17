@@ -1,6 +1,7 @@
 import re
 import warnings
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -13,6 +14,13 @@ try:
     from anndata.io import read_elem, sparse_dataset  # anndata >=0.11
 except ModuleNotFoundError:
     from anndata.experimental import read_elem, sparse_dataset  # anndata <0.11
+
+# Try to import read_elem_lazy from anndata (available in newer versions)
+try:
+    from anndata.experimental import read_elem_lazy  # for anndata >=0.12
+except ImportError:
+    read_elem_lazy = None
+
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
@@ -584,28 +592,48 @@ def _read_slot_dask(
     elem = group[slot]
     iospec = ad._io.specs.get_spec(elem)
 
-    if iospec.encoding_type in ("csr_matrix", "csc_matrix"):
+    is_sparse = iospec.encoding_type in ("csr_matrix", "csc_matrix")
+    is_array = iospec.encoding_type == "array"
+    needs_conversion = iospec.encoding_type in force_sparse_types or force_slot_sparse
+
+    # Use anndata's native lazy loading if available
+    if read_elem_lazy is not None and (is_sparse or is_array or needs_conversion):
+        result = read_elem_lazy(elem, chunks=chunks)
+        if needs_conversion:
+            print_flushed(
+                f"Convert {slot} blocks to csr_matrix...",
+                verbose=verbose,
+            )
+            result = result.map_blocks(csr_matrix_int64_indptr, dtype=result.dtype)
+        return result
+
+    # Fallback to custom sparse_dask functions
+    if is_sparse:
         if backed:
             print_flushed(f"Read {slot} as backed sparse dask array...", verbose=verbose)
             elem = sparse_dataset(elem)
-            return sparse_dataset_as_dask(elem, stride=stride)
-        print_flushed(f"Read {slot} as sparse dask array...", verbose=verbose)
-        elem = read_as_dask_array(elem, chunks=chunks, verbose=verbose)
-        return elem.map_blocks(csr_matrix_int64_indptr, dtype=elem.dtype)
-
-    elif iospec.encoding_type in force_sparse_types or force_slot_sparse:
+            result = sparse_dataset_as_dask(elem, stride=stride)
+        else:
+            print_flushed(f"Read {slot} as sparse dask array...", verbose=verbose)
+            # determine smallest safe integer dtypes for indices/indptr from metadata
+            indptr_dtype, indices_dtype = _optimal_sparse_index_dtypes(elem)
+            result = read_as_dask_array(elem, chunks=chunks, verbose=verbose)
+            fn = partial(csr_matrix_int64_indptr, indptr_dtype=indptr_dtype, indices_dtype=indices_dtype)
+            result = result.map_blocks(fn, dtype=result.dtype)
+    elif needs_conversion:
         print_flushed(
             f"Read {slot} as dask array and convert blocks to csr_matrix...",
             verbose=verbose,
         )
-        elem = read_as_dask_array(elem, chunks=chunks, verbose=verbose)
-        return elem.map_blocks(csr_matrix_int64_indptr, dtype=elem.dtype)
-
-    elif iospec.encoding_type == "array":
+        result = read_as_dask_array(elem, chunks=chunks, verbose=verbose)
+        result = result.map_blocks(csr_matrix_int64_indptr, dtype=result.dtype)
+    elif is_array:
         print_flushed(f"Read {slot} as dask array...", verbose=verbose)
-        return read_as_dask_array(elem, chunks=chunks, verbose=verbose)
+        result = read_as_dask_array(elem, chunks=chunks, verbose=verbose)
+    else:
+        result = read_elem(elem)
 
-    return read_elem(elem)
+    return result
 
 
 def _read_slot_default(
@@ -654,7 +682,7 @@ def _read_slot_default(
         return read_elem(elem)
 
 
-def csr_matrix_int64_indptr(x: Any) -> csr_matrix:
+def csr_matrix_int64_indptr(x: Any, indptr_dtype=None, indices_dtype=None) -> csr_matrix:
     """
     Convert a sparse matrix to csr_matrix with int64 indices and indptr.
 
@@ -670,11 +698,30 @@ def csr_matrix_int64_indptr(x: Any) -> csr_matrix:
     csr
         Matrix with int64 indices and indptr.
     """
+    # backward-compatible behaviour: if called without dtype hints, cast int32 -> int64
     if not isinstance(x, csr_matrix):
         x = csr_matrix(x)
-    if x.indptr.dtype == np.int32:
+    if indptr_dtype is not None:
+        x.indptr = x.indptr.astype(indptr_dtype)
+    elif x.indptr.dtype == np.int32:
         x.indptr = x.indptr.astype(np.int64)
-    if x.indices.dtype == np.int32:
-        # seems to be necessary to avoid "ValueError: Output dtype not compatible with inputs."
+
+    if indices_dtype is not None:
+        x.indices = x.indices.astype(indices_dtype)
+    elif x.indices.dtype == np.int32:
         x.indices = x.indices.astype(np.int64)
+
     return x
+
+
+def _optimal_sparse_index_dtypes(elem_group: h5py.Group | zarr.Group):
+    """Determine optimal int dtypes for CSR/CSC index arrays from zarr/h5py metadata only.
+
+    Returns (indptr_dtype, indices_dtype) where each is either `np.int32` or `np.int64`.
+    """
+    total_nnz = elem_group["indices"].shape[0]
+    shape = elem_group.attrs.get("shape", None)
+    n_minor = shape[1] if shape is not None and len(shape) > 1 else None
+    indptr_dtype = np.int32 if total_nnz <= np.iinfo(np.int32).max else np.int64
+    indices_dtype = np.int32 if n_minor is None or (n_minor - 1) <= np.iinfo(np.int32).max else np.int64
+    return indptr_dtype, indices_dtype
