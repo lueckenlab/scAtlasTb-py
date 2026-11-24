@@ -29,3 +29,30 @@
     get_adjacency
     knn_overlap
 ```
+
+## Moran's I
+
+```{eval-rst}
+.. autosummary::
+    :nosignatures:
+    :toctree: ../generated
+
+    morans_i
+    morans_i_categorical
+    morans_i_features
+    morans_i_genes
+    morans_i_genescore
+    morans_i_random
+    match_genes
+```
+
+## Bootstrapping
+
+```{eval-rst}
+.. autosummary::
+    :nosignatures:
+    :toctree: ../generated
+
+    bootstrap_metric
+    get_bootstrap_adata
+```

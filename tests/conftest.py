@@ -64,3 +64,9 @@ def adata_dask_backed(adata):
         adata.write_zarr(p)
         adata_dask = sa.io.read_anndata(p, dask=True, backed=True)
         yield adata_dask
+
+
+@pytest.fixture
+def adata_real():
+    """Real data with precomputed PCA and kNN graph."""
+    return sc.datasets.pbmc68k_reduced()
