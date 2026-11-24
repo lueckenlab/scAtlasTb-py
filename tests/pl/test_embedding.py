@@ -109,3 +109,27 @@ def test_plot_centroids():
         files = os.listdir(tmpdir)
         assert any(f.endswith(".png") for f in files)
         assert adata.n_obs == n_before
+
+
+def test_embedding_return_annotated_labels():
+    adata = make_adata()
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        annotated_labels = embedding(
+            adata,
+            basis="X_umap",
+            color="group",
+            output_dir=tmpdir,
+            title="Annotated labels",
+            dpi=80,
+            figsize=(4, 4),
+            return_annotated_labels=True,
+        )
+        files = os.listdir(tmpdir)
+        assert any(f.endswith(".png") for f in files)
+
+    assert annotated_labels["group"]["labels"] == ["C (n=2)", "A (n=3)", "B (n=1)"]
+    assert set(annotated_labels["group"]["label_colors"]) == {"C (n=2)", "A (n=3)", "B (n=1)"}
+    assert all(color.startswith("#") for color in annotated_labels["group"]["label_colors"].values())

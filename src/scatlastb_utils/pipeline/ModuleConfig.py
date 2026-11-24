@@ -368,8 +368,13 @@ class ModuleConfig:
         self.set_default_target()
 
     def get_profile(self, wildcards: [dict, Any]):
-        """Get the resource profile for the given wildcards."""
-        return self.get_from_parameters(wildcards, "resources")
+        """Get the resource profile for the given wildcards.
+
+        default: return "cpu" if no "resources" is present in the WildcardsParameters.wildcards_df object
+        """
+        if "resources" in self.parameters.wildcards_df.columns:
+            return self.get_from_parameters(wildcards, "resources", default="cpu")
+        return "cpu"
 
     def get_resource(
         self,

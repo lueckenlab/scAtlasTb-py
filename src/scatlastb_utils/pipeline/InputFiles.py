@@ -1,4 +1,5 @@
 from pathlib import Path
+from pprint import pformat
 
 import pandas as pd
 
@@ -102,4 +103,9 @@ class InputFiles:
 
     def get_file(self, dataset, file_id) -> [str, Path]:
         """Get file path for a given dataset and file ID."""
-        return self.get_files_per_dataset(dataset)[file_id]
+        file_map = self.get_files_per_dataset(dataset)
+        try:
+            file = file_map[file_id]
+        except KeyError as e:
+            raise ValueError(f'File "{file_id}" not found\n {pformat(list(file_map.keys()))}') from e
+        return file

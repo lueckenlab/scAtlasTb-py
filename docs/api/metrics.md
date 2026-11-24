@@ -29,3 +29,13 @@
     get_adjacency
     knn_overlap
 ```
+
+## Helper functions
+
+```{eval-rst}
+.. autosummary::
+    :nosignatures:
+    :toctree: ../generated
+
+    sparse_correlation
+```

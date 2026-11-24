@@ -5,11 +5,13 @@ import multiprocessing
 import dask.array as da
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from scipy import sparse as sp
 from scipy.spatial import distance
 from tqdm import tqdm
+
+from ._sparse_correlation import sparse_correlation
 
 multiprocessing.set_start_method("spawn", force=True)
 
@@ -43,19 +45,25 @@ def _symmetrize_mask(x, verbose=False):
     return row_mask, col_mask
 
 
-def is_symmetric(x):
+def is_symmetric(x, tol: float = 0.0) -> bool:
     """Check if a sparse matrix is symmetric.
 
-    A matrix is symmetric if it is equal to its transpose.
-
     :param x: sparse matrix to check
-    :return: True if the matrix is symmetric, False otherwise
+    :param tol: tolerance for numeric differences (default 0.0)
+    :return: True if the matrix is symmetric within `tol`, False otherwise
     """
-    # Check if the matrix is equal to its transpose
-    # return (x != x.transpose()).nnz == 0
-    # return sp.triu(x).nnz == sp.tril(x).nnz
-    return (x.sum(0) % 2 == 0).all()
-    # return (x != x.T).nnz == 0
+    # Compute sparse difference; stays sparse and scales with nnz
+    diff = x - x.T
+    if diff.nnz == 0:
+        return True
+    if tol > 0.0:
+        return np.max(np.abs(diff.data)) <= tol
+    return False
+
+
+def is_constant(arr):
+    """Check if all values in an array are the same."""
+    return arr[0] == arr[-1] and arr.min() == arr.max()
 
 
 def symmetrize_if_needed(x):
@@ -73,7 +81,7 @@ def symmetrize_if_needed(x):
     return x.maximum(x.T)
 
 
-def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs):
+def _compute_distances(rows, cols, obsm, batch_size=10_000, n_jobs=-1, joblib_kwargs=None, **kwargs):
     """Compute distances for given rows and columns in obsm.
 
     :param rows: row indices for which distances should be computed
@@ -81,6 +89,7 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
     :param obsm: embedding matrix from which distances are computed
     :param n_jobs: number of jobs to run in parallel, -1 for all available cores
     :param batch_size: batch size for distance computation
+    :param joblib_kwargs: keyword arguments for parallel computation
     :param kwargs: additional keyword arguments for distance computation, e.g. metric='euclidean'
     :return: distances for the given rows and columns
     """
@@ -102,9 +111,10 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
             _compute_row_distance(obsm, *args)
             for args in tqdm(
                 zip(unique_rows, first_occurrence, last_occurrence, strict=False),
-                desc="Computing distances",
+                desc=f"Computing distances with {n_jobs=}",
                 mininterval=1,
                 total=n_rows,
+                leave=False,
             )
         ]
 
@@ -125,9 +135,16 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
                 )
                 for i in range(0, n_rows, batch_size)
             )
-            results = Parallel(n_jobs=n_jobs, backend="loky")(
+            if joblib_kwargs is None:
+                joblib_kwargs = {"prefer": "processes"}
+            results = Parallel(n_jobs=n_jobs, **joblib_kwargs)(
                 delayed(_compute_batch)(obsm_mmap, *args)
-                for args in tqdm(batched_args, desc="Computing distances", total=int(n_rows / batch_size))
+                for args in tqdm(
+                    batched_args,
+                    desc=f"Computing distances with {n_jobs=}",
+                    total=int(n_rows / batch_size),
+                    leave=False,
+                )
             )
             # Flatten the list of lists
             results = (item for sublist in results for item in sublist)
@@ -148,50 +165,45 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
 
 def compute_missing_distances(
     adata,
-    obsp_key_1,
+    obsp_key,
     obsm_key,
-    obsp_key_2,
+    conn_mask,
     inplace=True,
     return_matrix=True,
+    batch_size=10_000,
     n_jobs=-1,
-    batch_size=100_000,
+    joblib_kwargs=None,
     **kwargs,
 ):
-    """Compute missing distances.
+    """Recompute missing pairwise distances restricted to a neighbor mask.
 
-    Due to scanpy's heuristic, only distances for k-nearest neighbors are kept.
-    In order to compare distances across embeddings, the corresponding distances of edges from one embedding
-    must be present or recomputed for the other embedding.
+    :param adata: AnnData-like object with `obsp` and `obsm` attributes.
+    :param obsp_key: Key in ``adata.obsp`` containing the distance matrix to update.
+    :param obsm_key: Key in ``adata.obsm`` containing the embedding used to compute distances.
+    :param conn_mask: scipy.sparse binary mask of connectivities to determine missing distances.
+    :param inplace: If True, store the updated distance matrix back to ``adata.obsp[obsp_key]``.
+    :param return_matrix: If True, return the updated matrix.
+    :param n_jobs: Number of parallel jobs to use for distance computation.
+    :param batch_size: Batch size used for distance computation.
+    :param kwargs: Passed to the distance computation routine (e.g., ``metric``).
 
-    :param obsp_key_1: slot for pair-wise distances from embedding 1
-    :param obsm_key: slot for embedding 1 used for missing distance computation
-    :param obsp_key_2: slot slot for pair-wise distances from embedding 2
-    :param inplace: if True, set distances inplace in adata.obsp[obsp_key_1]
-    :param n_jobs: number of jobs to run in parallel, -1 for all available cores
-    :param batch_size: batch size for distance computation
-    :param kwargs: additional keyword arguments for distance computation, e.g. metric='euclidean'
-    :param return_matrix: if True, return the distance matrix
+    :returns: scipy.sparse matrix when ``return_matrix`` is True, otherwise None.
     """
-    x1 = adata.obsp[obsp_key_1]
-    x2 = adata.obsp[obsp_key_2]
+    x = adata.obsp[obsp_key]
     obsm = adata.obsm[obsm_key]
 
-    if isinstance(x1, da.Array):
-        x1 = x1.compute()
-    if isinstance(x2, da.Array):
-        x2 = x2.compute()
+    if isinstance(x, da.Array):
+        x = x.compute()
+    if isinstance(conn_mask, da.Array):
+        conn_mask = conn_mask.compute()
 
     # fill in missing values to make distance matrix symmetric
-    for _ in tqdm(range(1), desc="Symmetrize matrix"):
-        x1 = symmetrize_if_needed(x1)
-        x2 = symmetrize_if_needed(x2)
+    x = symmetrize_if_needed(x)
 
-    # get neighbors that are not computed in the other graph
-    print("Determine missing distances...")
-    x1_adj, x2_adj = sp.triu(x1 > 0), sp.triu(x2 > 0)
-    # XOR and x1 values > 0
-    rows, cols = (x1_adj != x2_adj).multiply(x2_adj).nonzero()
-    del x1_adj, x2_adj
+    # determine candidate neighbor edges from provided mask and select those missing in x
+    rows, cols = sp.triu(conn_mask).nonzero()
+    positive = x[rows, cols].A1 > 0
+    rows, cols = rows[~positive], cols[~positive]
 
     n_distances = len(rows)
     print(f"{n_distances} edges to recompute")
@@ -204,23 +216,20 @@ def compute_missing_distances(
             obsm,
             n_jobs=n_jobs,
             batch_size=batch_size,
+            joblib_kwargs=joblib_kwargs,
             **kwargs,
         )
 
         # add distances to distance matrix in place
-        new_distances = sp.coo_matrix(
-            (new_distances, (rows, cols)),
-            shape=x1.shape,
-            dtype="float32",
-        )
-        x1 = (x1.tocoo() + new_distances + new_distances.T).tocsr()
+        new_distances = sp.coo_matrix((new_distances, (rows, cols)), shape=x.shape, dtype="float32")
+        x = (x.tocoo() + new_distances + new_distances.T).tocsr()
 
     if inplace:
         print("Set distances inplace...")
-        adata.obsp[obsp_key_1] = x1
+        adata.obsp[obsp_key] = x
 
     if return_matrix:
-        return x1
+        return x
 
 
 def plot_ranked_distances(adata, x1, x2):
@@ -266,13 +275,15 @@ def plot_distances_scatter(adata, x1, x2, **kwargs):
     :param x2: name of the graph distances of the second embedding
     :param kwargs: additional keyword arguments for the plt.scatter plot, e.g. `c`, `s`, `alpha`
     """
+    comp1 = f"{x1}-vs-{x2}"
+    comp2 = f"{x2}-vs-{x1}"
     # TODO: move to pl?
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     ax1.scatter(
-        adata.obs[f"avg_distance_1:{x1}-vs-{x2}"],
-        adata.obs[f"avg_distance_2:{x1}-vs-{x2}"],
+        adata.obs[f"avg_distance_1:{comp1}"],
+        adata.obs[f"avg_distance_2:{comp1}"],
         **kwargs,
     )
     ax1.set_xlabel(x1)
@@ -281,72 +292,16 @@ def plot_distances_scatter(adata, x1, x2, **kwargs):
 
     metrics = ["avg_difference", "avg_distance_diff"]
     for metric in metrics:
-        ax2.scatter(
-            adata.obs[f"{metric}:{x1}-vs-{x2}"],
-            adata.obs[f"{metric}:{x2}-vs-{x1}"],
-            label=metric,
-            **kwargs,
-        )
-    ax2.set_xlabel(metrics[0])
-    ax2.set_ylabel(metrics[1])
+        x = f"{metric}:{comp1}"
+        y = f"{metric}:{comp2}"
+        ax2.scatter(adata.obs[x], adata.obs[y], label=metric, **kwargs)
+    ax2.set_xlabel(comp1)
+    ax2.set_ylabel(comp2)
     ax2.set_title("Graph differences")
     ax2.legend(loc="upper left", bbox_to_anchor=(1, 1))
 
     fig.subplots_adjust(wspace=0.5)
     plt.show()
-
-
-def sparse_spearman(matrix1: sp.spmatrix, matrix2: sp.spmatrix, max_workers=None, n_jobs=-1):
-    """Calculate Spearman correlation for each row in two sparse distance matrices.
-
-    This function computes the Spearman correlation only for local neighborhoods.
-
-    :param matrix1: First sparse matrix (scipy.sparse format).
-    :param matrix2: Second sparse matrix (scipy.sparse format).
-    :param max_workers: Maximum number of workers for parallel computation.
-    :param n_jobs: Number of jobs to run in parallel. If -1, use all available cores.
-    """
-
-    def _sparse_spearman(row1, row2):
-        def pad_zeros(x, shape):
-            x_pad = np.zeros(shape, dtype=x.dtype)
-            x_pad[-x.shape[0] :] = x
-            return x_pad
-
-        n, n2 = row1.shape[0], row2.shape[0]
-
-        # Avoid division by zero for constant rows
-        if n <= 1 or n2 <= 1 or np.all(row1 == row1[0]) or np.all(row2 == row2[0]):
-            return np.nan
-
-        # check if rows have same length, otherwise pad with zeros
-        if n > n2:
-            row2 = pad_zeros(row2, n)
-        elif n < n2:
-            row1 = pad_zeros(row1, n2)
-
-        # Rank the data
-        rank1 = np.argsort(np.argsort(row1)) + 1
-        rank2 = np.argsort(np.argsort(row2)) + 1
-
-        # Calculate Spearman correlation
-        return 1 - (6 * np.sum((rank1 - rank2) ** 2)) / (n * (n**2 - 1))
-
-    def get_row_data(x, i):
-        return x.data[x.indptr[i] : x.indptr[i + 1]]
-
-    assert matrix1.shape == matrix2.shape, f"shape mismatch: {matrix1.shape}, {matrix2.shape}"
-
-    n_rows = matrix1.shape[0]
-    row_data = [(get_row_data(matrix1, i), get_row_data(matrix2, i)) for i in range(n_rows)]
-
-    with parallel_backend("loky"):
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(_sparse_spearman)(row1, row2)
-            for row1, row2 in tqdm(row_data, desc="Spearman correlation", mininterval=1, total=n_rows)
-        )
-
-    return np.array(results)
 
 
 def get_knn(x, k):
@@ -389,14 +344,18 @@ def get_knn(x, k):
 
 def compare_distances(
     adata,
-    obsp_key_1,
+    obsp_connectivities_1,
+    obsp_distances_1,
     obsm_key_1,
-    obsp_key_2,
+    obsp_connectivities_2,
+    obsp_distances_2,
     obsm_key_2,
     scale_distances=True,
     quantile=0.9,
-    k_max=50,
+    k_max=None,
     log_scale_diffs=False,
+    n_jobs=1,
+    batch_size=10_000,
     **kwargs,
 ):
     """Compare distances of same edges but from different representations.
@@ -409,57 +368,73 @@ def compare_distances(
     4. "average_distance_diff": the average of the differences between the two embeddings
     5. "spearman_correlation": the Spearman correlation of the distance differences (of the k-nearest neighbors only)
 
-    :param adata: AnnData object containing the distances in obsp
-    :param obsp_key_1: slot for pair-wise distances from embedding 1
-    :param obsm_key_1: slot for embedding 1 used for distance computation
-    :param obsp_key_2: slot for pair-wise distances from embedding 2
-    :param obsm_key_2: slot for embedding 2 used for distance computation
+    Neighborhoods are inferred from connectivities of embedding 1. If k_max is None, all non-zero
+    connectivities are used.
+
+    :param adata: AnnData object containing the graph data in obsp
+    :param obsp_connectivities_1: slot for connectivities from embedding 1
+    :param obsp_distances_1: slot for pair-wise distances from embedding 1
+    :param obsm_key_1: slot for embedding 1 used for missing distance computation
+    :param obsp_connectivities_2: slot for connectivities from embedding 2
+    :param obsp_distances_2: slot for pair-wise distances from embedding 2
+    :param obsm_key_2: slot for embedding 2 used for missing distance computation
     :param scale_distances: if True, scale distances by the quantile of the distances
     :param quantile: quantile to scale distances by, default is 0.9
     :param k_max: maximum number of neighbors to consider, default is 50
     :param log_scale_diffs: if True, log scale the differences
+    :param n_jobs: number of parallel jobs to run, default is 1
+    :param batch_size: number of rows to process per batch, default is 10_000
     :param kwargs: additional keyword arguments for distance computation, e.g. metric='euclidean'
     :return: DataFrame with average distances and differences
     """
-    if isinstance(adata.obsp[obsp_key_1], da.Array):
-        adata.obsp[obsp_key_1] = adata.obsp[obsp_key_1].compute()
+    if isinstance(adata.obsp[obsp_distances_1], da.Array):
+        adata.obsp[obsp_distances_1] = adata.obsp[obsp_distances_1].compute()
 
-    if isinstance(adata.obsp[obsp_key_2], da.Array):
-        adata.obsp[obsp_key_2] = adata.obsp[obsp_key_2].compute()
+    if isinstance(adata.obsp[obsp_distances_2], da.Array):
+        adata.obsp[obsp_distances_2] = adata.obsp[obsp_distances_2].compute()
+
+    if isinstance(adata.obsp[obsp_connectivities_1], da.Array):
+        adata.obsp[obsp_connectivities_1] = adata.obsp[obsp_connectivities_1].compute()
+
+    if isinstance(adata.obsp[obsp_connectivities_2], da.Array):
+        adata.obsp[obsp_connectivities_2] = adata.obsp[obsp_connectivities_2].compute()
+
+    if k_max is not None:
+        conn_mask = get_knn(adata.obsp[obsp_connectivities_1], k=k_max) > 0
+    else:
+        conn_mask = adata.obsp[obsp_connectivities_1] > 0
 
     x2 = compute_missing_distances(
         adata,
-        obsp_key_1=obsp_key_2,
+        obsp_key=obsp_distances_2,
         obsm_key=obsm_key_2,
-        obsp_key_2=obsp_key_1,
+        conn_mask=conn_mask,
         inplace=False,
         return_matrix=True,
+        n_jobs=n_jobs,
+        batch_size=batch_size,
         **kwargs,
     ).copy()
 
-    x1 = get_knn(adata.obsp[obsp_key_1], k=k_max)
-    nnz_mask = x1 > 0
-    x2 = x2.multiply(nnz_mask)
+    x1 = adata.obsp[obsp_distances_1].copy()
+    x1 = x1.multiply(conn_mask)
+    x1.eliminate_zeros()
+    x2 = x2.multiply(conn_mask)
     x2.eliminate_zeros()
 
-    degrees = nnz_mask.sum(axis=0)
+    degrees = conn_mask.sum(axis=0)
     degrees[degrees == 0] = 1
-    # print('zero degrees', (degrees == 0).sum())
-    # print('zero degrees', ((x1 > 0).sum(axis=0) == 0).sum())
-    # print('zero degrees', (x1.sum(axis=0) == 0).sum())
 
     if scale_distances:
-        # x1.data = 1 / np.log10(x1.data + 1)
-        # x2.data = 1 / np.log10(x2.data + 1)
         print(f"scale distances by {quantile} quantile...")
-        x1.data /= np.quantile(adata.obsp[obsp_key_1].data, q=quantile)
-        x2.data /= np.quantile(adata.obsp[obsp_key_2].data, q=quantile)
+        x1.data /= np.quantile(adata.obsp[obsp_distances_1].data, q=quantile)
+        x2.data /= np.quantile(adata.obsp[obsp_distances_2].data, q=quantile)
 
     print("Calculate differences...")
-    diff_mtx = x1 - x2
+    diff_mtx = x2 - x1
     diff_mtx.data = np.abs(diff_mtx.data)
     avg_diff = (diff_mtx.sum(axis=0) / degrees).A1
-    avg_dist_diff = np.abs((x1.sum(axis=0) - x2.sum(axis=0)) / degrees).A1
+    avg_dist_diff = np.abs((x2.sum(axis=0) - x1.sum(axis=0)) / degrees).A1
 
     # if scale:
     #     print(f'scale by {quantile} quantile...')
@@ -478,7 +453,7 @@ def compare_distances(
             "average_distance_2": (x2.sum(axis=0) / degrees).A1,
             "average_difference": avg_diff,
             "average_distance_diff": avg_dist_diff,
-            "spearman_correlation": sparse_spearman(x1, x2),
+            "spearman_correlation": sparse_correlation(x1, x2, mask=conn_mask, method="spearman"),
         },
         index=adata.obs_names,
     )

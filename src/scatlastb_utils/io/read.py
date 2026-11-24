@@ -1,5 +1,5 @@
+import logging
 import re
-import warnings
 from collections.abc import Callable
 from pathlib import Path
 from pprint import pformat
@@ -274,7 +274,7 @@ def read_anndata(
             message += f"\nfile: {file}\navailable slots: {list(store)}"
             if fail_on_missing:
                 raise ValueError(message)
-            warnings.warn(f"{message}, will be skipped", stacklevel=2)
+            logging.warning(f"{message}, will be skipped")
     adata = read_partial(
         file,
         store,
@@ -502,7 +502,7 @@ def read_slot(
     if slot_name not in group:
         if fail_on_missing:
             raise ValueError(f'Slot "{slot_name}" not found in {file}')
-        warnings.warn(f'Slot "{slot_name}" not found, skip...', stacklevel=2)
+        logging.warning(f'Slot "{slot_name}" not found, skip...')
         return None
 
     if dask:
