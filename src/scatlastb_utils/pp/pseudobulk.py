@@ -178,10 +178,10 @@ def _aggregate_obs(
     counts = obs.groupby(group_key, observed=True).size()
     df["n_agg"] = counts.reindex(group_order).fillna(0).astype(int)
 
-    # Convert metadata to categorical
-    for col in df.columns:
-        if isinstance(df[col].dtype, pd.CategoricalDtype):
-            df[col] = df[col].astype(str).astype("category")
+    # Convert aggregated categorical columns to pandas `category` dtype
+    for col in cat_columns:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
 
     return df
 
@@ -332,6 +332,8 @@ def pseudobulk(
     they are joined using ``sep`` and the combined label is used for
     grouping.
     """
+    assert adata.n_obs > 0, "Input adata has no observations"
+    assert adata.n_vars > 0, "Input adata has no variables"
     adata = adata.copy()
 
     # Normalize group_key to a single column name
@@ -359,7 +361,8 @@ def pseudobulk(
         logging.info(f"Filtering groups with at least {min_cells} cells...")
         value_counts = value_counts[value_counts >= min_cells]
         mask = adata.obs[group_key].isin(value_counts.index)
-        logging.info(f"Remove {mask.sum()} cells from groups with fewer than {min_cells} cells")
+        if ~mask.any():
+            logging.info(f"Keep {mask.sum()} cells from groups with at least {min_cells} cells")
 
     logging.info(f"Aggregate {value_counts.shape[0]} pseudobulks...")
     pseudobulks, groups = _get_pseudobulk_matrix(

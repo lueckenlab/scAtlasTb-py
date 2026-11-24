@@ -5,11 +5,13 @@ import multiprocessing
 import dask.array as da
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from scipy import sparse as sp
 from scipy.spatial import distance
 from tqdm import tqdm
+
+from ._sparse_correlation import sparse_correlation
 
 multiprocessing.set_start_method("spawn", force=True)
 
@@ -79,7 +81,7 @@ def symmetrize_if_needed(x):
     return x.maximum(x.T)
 
 
-def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs):
+def _compute_distances(rows, cols, obsm, batch_size=10_000, n_jobs=-1, joblib_kwargs=None, **kwargs):
     """Compute distances for given rows and columns in obsm.
 
     :param rows: row indices for which distances should be computed
@@ -87,6 +89,7 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
     :param obsm: embedding matrix from which distances are computed
     :param n_jobs: number of jobs to run in parallel, -1 for all available cores
     :param batch_size: batch size for distance computation
+    :param joblib_kwargs: keyword arguments for parallel computation
     :param kwargs: additional keyword arguments for distance computation, e.g. metric='euclidean'
     :return: distances for the given rows and columns
     """
@@ -108,9 +111,10 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
             _compute_row_distance(obsm, *args)
             for args in tqdm(
                 zip(unique_rows, first_occurrence, last_occurrence, strict=False),
-                desc="Computing distances",
+                desc=f"Computing distances with {n_jobs=}",
                 mininterval=1,
                 total=n_rows,
+                leave=False,
             )
         ]
 
@@ -131,9 +135,16 @@ def _compute_distances(rows, cols, obsm, n_jobs=-1, batch_size=100_000, **kwargs
                 )
                 for i in range(0, n_rows, batch_size)
             )
-            results = Parallel(n_jobs=n_jobs, backend="loky")(
+            if joblib_kwargs is None:
+                joblib_kwargs = {"prefer": "processes"}
+            results = Parallel(n_jobs=n_jobs, **joblib_kwargs)(
                 delayed(_compute_batch)(obsm_mmap, *args)
-                for args in tqdm(batched_args, desc="Computing distances", total=int(n_rows / batch_size))
+                for args in tqdm(
+                    batched_args,
+                    desc=f"Computing distances with {n_jobs=}",
+                    total=int(n_rows / batch_size),
+                    leave=False,
+                )
             )
             # Flatten the list of lists
             results = (item for sublist in results for item in sublist)
@@ -159,8 +170,9 @@ def compute_missing_distances(
     conn_mask,
     inplace=True,
     return_matrix=True,
+    batch_size=10_000,
     n_jobs=-1,
-    batch_size=100_000,
+    joblib_kwargs=None,
     **kwargs,
 ):
     """Recompute missing pairwise distances restricted to a neighbor mask.
@@ -204,6 +216,7 @@ def compute_missing_distances(
             obsm,
             n_jobs=n_jobs,
             batch_size=batch_size,
+            joblib_kwargs=joblib_kwargs,
             **kwargs,
         )
 
@@ -289,70 +302,6 @@ def plot_distances_scatter(adata, x1, x2, **kwargs):
 
     fig.subplots_adjust(wspace=0.5)
     plt.show()
-
-
-def sparse_spearman(
-    m1: sp.spmatrix,
-    m2: sp.spmatrix,
-    mask: sp.spmatrix,
-    n_jobs: int = 1,
-    batch_size: int = 10_000,
-) -> np.ndarray:
-    """Calculate Spearman correlation for each row, restricted to local neighborhoods.
-
-    For each row i, only columns j where mask[i, j] != 0 are considered.
-    Values absent in m1 or m2 but present in mask are treated as 0.
-    Rows with fewer than 2 neighbors or constant values return NaN.
-
-    :param m1: First sparse matrix (scipy.sparse CSR format preferred).
-    :param m2: Second sparse matrix (scipy.sparse CSR format preferred).
-    :param mask: Sparse binary mask defining local neighborhoods.
-        Non-zero entries at [i, j] indicate that column j is a
-        valid neighbor for row i.
-    :param n_jobs: Number of parallel jobs. -1 uses all available cores.
-    :param batch_size: Number of rows to process per batch. Controls the
-        tradeoff between memory usage and parallelisation overhead.
-    :return: 1D array of Spearman correlations, one per row. NaN where
-        correlation is undefined (constant row or fewer than 2 neighbors).
-    """
-    from scipy.stats import rankdata
-
-    assert m1.shape == m2.shape == mask.shape, f"Shape mismatch: {m1.shape}, {m2.shape}, {mask.shape}"
-
-    # CSR for efficient row slicing
-    m1 = m1.tocsr()
-    m2 = m2.tocsr()
-    mask = mask.tocsr()
-    n_rows = m1.shape[0]
-
-    def _get_row_values(i):
-        cols = mask.indices[mask.indptr[i] : mask.indptr[i + 1]]
-        if len(cols) <= 1:
-            return None, None
-        row1 = m1[i, cols].toarray().ravel()
-        row2 = m2[i, cols].toarray().ravel()
-        return row1, row2
-
-    def _spearman(row1, row2) -> float:
-        if row1 is None:
-            return np.nan
-        if is_constant(row1) or is_constant(row2):
-            return np.nan
-        n = len(row1)
-        rank1 = rankdata(row1)
-        rank2 = rankdata(row2)
-        return 1.0 - (6.0 * np.sum((rank1 - rank2) ** 2)) / (n * (n**2 - 1))
-
-    results = []
-    batches = range(0, n_rows, batch_size)
-    for start in tqdm(batches, desc="Spearman correlation", unit="batch"):
-        end = min(start + batch_size, n_rows)
-        batch = [_get_row_values(i) for i in range(start, end)]
-        with parallel_backend("loky"):
-            batch_results = Parallel(n_jobs=n_jobs)(delayed(_spearman)(row1, row2) for row1, row2 in batch)
-        results.extend(batch_results)
-
-    return np.array(results)
 
 
 def get_knn(x, k):
@@ -477,17 +426,15 @@ def compare_distances(
     degrees[degrees == 0] = 1
 
     if scale_distances:
-        # x1.data = 1 / np.log10(x1.data + 1)
-        # x2.data = 1 / np.log10(x2.data + 1)
         print(f"scale distances by {quantile} quantile...")
         x1.data /= np.quantile(adata.obsp[obsp_distances_1].data, q=quantile)
         x2.data /= np.quantile(adata.obsp[obsp_distances_2].data, q=quantile)
 
     print("Calculate differences...")
-    diff_mtx = x1 - x2
+    diff_mtx = x2 - x1
     diff_mtx.data = np.abs(diff_mtx.data)
     avg_diff = (diff_mtx.sum(axis=0) / degrees).A1
-    avg_dist_diff = np.abs((x1.sum(axis=0) - x2.sum(axis=0)) / degrees).A1
+    avg_dist_diff = np.abs((x2.sum(axis=0) - x1.sum(axis=0)) / degrees).A1
 
     # if scale:
     #     print(f'scale by {quantile} quantile...')
@@ -506,7 +453,7 @@ def compare_distances(
             "average_distance_2": (x2.sum(axis=0) / degrees).A1,
             "average_difference": avg_diff,
             "average_distance_diff": avg_dist_diff,
-            "spearman_correlation": sparse_spearman(x1, x2, mask=conn_mask, n_jobs=n_jobs, batch_size=batch_size),
+            "spearman_correlation": sparse_correlation(x1, x2, mask=conn_mask, method="spearman"),
         },
         index=adata.obs_names,
     )

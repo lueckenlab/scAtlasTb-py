@@ -5,7 +5,7 @@ from .graph_distance import (
     is_symmetric,
     plot_distances_scatter,
     plot_ranked_distances,
-    sparse_spearman,
+    sparse_correlation,
     symmetrize_if_needed,
 )
 from .knn_overlap import get_adjacency, knn_overlap

@@ -16,7 +16,28 @@ from pandas.api.types import is_categorical_dtype, is_numeric_dtype, is_string_d
 from tqdm import tqdm
 
 from scatlastb_utils.pp.sample import sample
-from scatlastb_utils.utils import _sanitize_default_file_name, dask_compute, parse_gene_names, remove_outliers
+from scatlastb_utils.utils import (
+    _sanitize_default_file_name,
+    dask_compute,
+    handle_verbosity,
+    parse_gene_names,
+    remove_outliers,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _get_legend_label_colors(legend):
+    """Return legend colors keyed by the displayed legend text."""
+    label_colors = {}
+    for handle, text in zip(legend.legend_handles, legend.get_texts(), strict=False):
+        if not hasattr(handle, "get_facecolor"):
+            continue
+        facecolor = handle.get_facecolor()
+        if len(facecolor) == 0:
+            continue
+        label_colors[text.get_text()] = mpl.colors.to_hex(facecolor[0], keep_alpha=False)
+    return label_colors
 
 
 def _format_legend_labels(legend, obs, color, annotate_legend, category_index_map, bold_labels):
@@ -37,6 +58,7 @@ def _format_legend_labels(legend, obs, color, annotate_legend, category_index_ma
     else:
         category_counts_str = {}
 
+    annotated_labels = []
     for text in legend.get_texts():
         label = text.get_text()
         # category numbers (SCTK-style)
@@ -52,6 +74,9 @@ def _format_legend_labels(legend, obs, color, annotate_legend, category_index_ma
             text.set_fontweight("bold")
         else:
             text.set_fontweight("normal")
+        annotated_labels.append(text.get_text())
+
+    return annotated_labels
 
 
 def _plot_centroids_on_embedding(
@@ -64,6 +89,7 @@ def _plot_centroids_on_embedding(
     legend_fontsize=10,
     bold_labels=None,
     adjust_text_kwargs=None,
+    luminance_threshold=0.4,
 ):
     """Plot category numbers at centroid positions on the embedding."""
     from adjustText import adjust_text
@@ -91,6 +117,7 @@ def _plot_centroids_on_embedding(
         bold_labels = []
 
     created_texts = []
+    arrow_colors = []
     for cat, row in centroids.iterrows():
         bg_color = color_map.get(cat, "white")
 
@@ -98,7 +125,7 @@ def _plot_centroids_on_embedding(
         try:
             r, g, b = mpl.colors.to_rgba(bg_color)[:3]
             luminance = 0.299 * r + 0.587 * g + 0.114 * b
-            text_color = "white" if luminance < 0.3 else "black"
+            text_color = "white" if luminance < luminance_threshold else "black"
         except (ValueError, TypeError):
             text_color = "white"
 
@@ -122,6 +149,7 @@ def _plot_centroids_on_embedding(
         )
         txt.set_path_effects([mpl.patheffects.Stroke(linewidth=2, foreground=bg_color), mpl.patheffects.Normal()])
         created_texts.append(txt)
+        arrow_colors.append(mpl.colors.to_hex(bg_color, keep_alpha=False))
 
     if adjust_text_kwargs is None:
         adjust_text_kwargs = dict(
@@ -129,7 +157,21 @@ def _plot_centroids_on_embedding(
             expand=(1.05, 1.05),
             autoalign=False,
         )
-    adjust_text(created_texts, ax=ax, **adjust_text_kwargs)
+
+    arrowprops = adjust_text_kwargs.get("arrowprops") if isinstance(adjust_text_kwargs, dict) else None
+    has_explicit_arrow_color = isinstance(arrowprops, dict) and any(
+        key in arrowprops for key in ("color", "c", "ec", "edgecolor", "fc", "facecolor")
+    )
+
+    adjusted = adjust_text(created_texts, ax=ax, **adjust_text_kwargs)
+
+    # If arrows are requested but no color is set, color each arrow by its category.
+    if not has_explicit_arrow_color and isinstance(adjusted, tuple) and len(adjusted) > 1:
+        arrows = adjusted[1]
+        for arrow, arrow_color in zip(arrows, arrow_colors, strict=False):
+            for setter in ("set_color", "set_edgecolor", "set_facecolor"):
+                if hasattr(arrow, setter):
+                    getattr(arrow, setter)(arrow_color)
 
 
 def _estimate_legend_width(categories, fontsize):
@@ -152,6 +194,7 @@ def _estimate_legend_width(categories, fontsize):
     return (total_width_pts / 72) + 0.1
 
 
+@handle_verbosity
 def _plot_color_axis(
     adata,
     color,
@@ -160,20 +203,25 @@ def _plot_color_axis(
     annotate_legend=True,
     plot_centroids=False,
     centroid_label_bold=False,
-    verbose=True,
+    verbose=False,
     file_name=None,
     title="",
     output_dir=None,
+    file_prefix="",
+    file_type="png",
     max_label_length=10,
     dpi=200,
     figsize=(6, 6),
     outline_thickness=2,
     adjust_text_kwargs=None,
     bold_labels=None,
-    warn_on_drop=True,
+    luminance_threshold=0.4,
+    return_annotated_labels=False,
+    show=True,
     **kwargs,
 ):
     """Plot a single color (or list of gene colors) and optionally save to disk."""
+    # verbosity handled by decorator; no local log-level changes required
     if obs is None:
         obs = adata.obs.copy()
 
@@ -191,7 +239,7 @@ def _plot_color_axis(
         figsize=figsize,
         dpi=dpi,
         dpi_save=dpi,
-        format="png",
+        format=file_type,
     )
 
     if len(colors) > 4:
@@ -202,34 +250,40 @@ def _plot_color_axis(
     color = colors[0] if colors else None
     palette = None
     categorical_legend = False
+    continuous_legend = False
+
     if len(colors) == 1 and color in adata.obs.columns:
         color_vec = adata.obs[color]
 
         if is_numeric_dtype(color_vec):
             palette = "coolwarm" if color_vec.min() < 0 else "plasma"
+            continuous_legend = True
 
         elif is_categorical_dtype(color_vec):
             categorical_legend = True
             ncat = color_vec.nunique()
             if ncat > 102:
-                if warn_on_drop:
-                    logging.warning(
-                        "Color '%s' has more than 102 categories, using 'turbo' palette and no legend", color
-                    )
+                logger.warning("Color '%s' has more than 102 categories, using 'turbo' palette and no legend", color)
                 palette = "turbo"
                 categorical_legend = False
             elif ncat > 20:
                 palette = sc.pl.palettes.godsnot_102
 
     legend_fontsize = kwargs.get("legend_fontsize", 10)
+    colorbar_title_fontsize = kwargs.pop("colorbar_title_fontsize", legend_fontsize)
+    colorbar_tick_fontsize = kwargs.pop("colorbar_tick_fontsize", max(colorbar_title_fontsize, 8))
     legend_width = 0
     if categorical_legend:
         legend_width = _estimate_legend_width(color_vec.cat.categories, legend_fontsize)
+
+    if isinstance(plot_centroids, str):
+        plot_centroids = [plot_centroids]
 
     total_width = figsize[0] + legend_width
     fig = plt.figure(figsize=(total_width, figsize[1]), constrained_layout=False)
     gs = fig.add_gridspec(1, 2, width_ratios=[figsize[0], legend_width], wspace=0.1)
     ax = fig.add_subplot(gs[0, 0])
+    annotated_labels = None
 
     try:
         sc.pl.embedding(
@@ -240,6 +294,7 @@ def _plot_color_axis(
             ax=ax,
             palette=palette,
             legend_loc="right margin" if categorical_legend else None,
+            colorbar_loc=None if continuous_legend else "right",
             **kwargs,
         )
 
@@ -262,9 +317,10 @@ def _plot_color_axis(
                     legend_fontsize=legend_fontsize,
                     bold_labels=bold_labels if centroid_label_bold else [],
                     adjust_text_kwargs=adjust_text_kwargs,
+                    luminance_threshold=luminance_threshold,
                 )
 
-            _format_legend_labels(
+            annotated_labels = _format_legend_labels(
                 legend=legend,
                 obs=obs,
                 color=color,
@@ -272,6 +328,12 @@ def _plot_color_axis(
                 category_index_map=category_index_map,
                 bold_labels=bold_labels,
             )
+        elif continuous_legend:
+            mappable = next(c for c in ax.collections if hasattr(c, "get_array") and c.get_array() is not None)
+            cbar = fig.colorbar(mappable, ax=ax, fraction=0.04, pad=0.02)
+            cbar.set_label(color, fontsize=colorbar_title_fontsize, rotation=270, labelpad=15)
+            cbar.ax.tick_params(labelsize=colorbar_tick_fontsize)
+            ax.set_title("")
 
         # adjust figure layout to accommodate legend and title
         plt.subplots_adjust(left=0.1, right=0.95, top=0.85, bottom=0.1)
@@ -279,42 +341,51 @@ def _plot_color_axis(
         if isinstance(title, str):
             fig.suptitle(f"{title}\nn={obs.shape[0]}", fontsize=12)
 
-        if verbose:
-            logging.info(f'Plotting color "{file_name}" successful.')
+        logger.info(f'Plotting color "{file_name}" successful.')
 
     except (ValueError, RuntimeError) as e:
         traceback.print_exc()
-        logging.error(f'Failed to plot "{file_name}": {e}')
+        logger.error(f'Failed to plot "{file_name}": {e}')
         fig = plt.figure()
     except Exception:
         raise
 
     if output_dir is not None:
-        out_path = Path(output_dir) / f"{file_name}.png"
+        out_path = Path(output_dir) / f"{file_prefix}{file_name}.{file_type}"
         try:
             fig.savefig(out_path, bbox_inches="tight")
         except (OSError, ValueError, RuntimeError) as e:
-            logging.error(f'Failed to save plot "{file_name}" to {out_path}: {e}')
+            logger.error(f'Failed to save plot "{file_name}" to {out_path}: {e}')
             traceback.print_exc()
         except Exception:
             raise
-    else:
+    if show:
         plt.show(fig)
     plt.close(fig)
 
+    if return_annotated_labels:
+        return file_name, {
+            "labels": annotated_labels,
+            "label_colors": _get_legend_label_colors(legend) if annotated_labels is not None else {},
+        }
 
+
+@handle_verbosity
 def embedding(
     adata,
     basis: str = "X_umap",
     color: str | list | None = None,
-    plot_centroids: list | None = None,
+    plot_centroids: list | bool | None = None,
     bold_labels: list | None = None,
     category_order: object = None,
     na_strings: str = ["NaN", "None", "", "nan", "unknown"],
     min_cells_per_category: float = 0,
     outlier_factor: float = 0,
+    luminance_threshold: float = 0.4,
     gene_chunk_size: int = 10,
     output_dir: Path | str | None = None,
+    file_prefix: str = "",
+    file_type: str = "png",
     title: str | bool = "",
     annotate_legend: bool = True,
     dpi: int = 200,
@@ -322,8 +393,10 @@ def embedding(
     figsize: tuple = (6, 6),
     downsample: float | int | None = None,
     adjust_text_kwargs: dict | None = None,
-    warn_on_drop: bool = True,
+    verbose: bool = False,
     inplace: bool = False,
+    return_annotated_labels: bool = False,
+    show: bool = True,
     **kwargs,
 ):
     """Plot a scanpy embedding for one or more colors with preprocessing and post-processing.
@@ -341,7 +414,7 @@ def embedding(
         One or more ``adata.obs`` column names or gene names to color by.
     plot_centroids
         Subset of ``color`` values for which centroid labels are drawn on the
-        embedding (sctk-style numbered circles).
+        embedding or bool if all colors should be considered. Numeric columns will be skipped.
     bold_labels
         List of category names to appear in bold in the legend.
     category_order
@@ -379,12 +452,15 @@ def embedding(
         Example keys include ``arrowprops`` (dict) and ``expand_text`` (tuple).
         Note: ``adjustText`` is a required dependency; import will fail with a
         clear error if it is not installed.
-    warn_on_drop
+    warn
         If True, log warnings when colors are dropped due to invalidity or low category counts.
     inplace
         If True, remove slots from adata inplace. This can be useful for scripts where the
         adata is not used afterwards, and memory footprint should be minimised to only what
         is essential for plotting.
+    return_annotated_labels
+        If True, return a dictionary mapping each plotted categorical obs color to the
+        annotated legend labels and their legend colors.
     **kwargs
         Additional keyword arguments forwarded to ``_plot_color_axis`` and
         ultimately to ``sc.pl.embedding`` (e.g. ``legend_fontsize``, ``ncols``).
@@ -405,14 +481,25 @@ def embedding(
         )
 
     """
-    plot_centroids = list(plot_centroids) if plot_centroids else []
+    original_adata = adata
     obs_columns = list(adata.obs.columns)
 
     # Parse color list and ensure centroid colors are included
     colors: list = color if isinstance(color, list) else ([color] if color is not None else [])
+
+    # parse colors to include as centroids
+    if plot_centroids:
+        if plot_centroids is True:
+            plot_centroids = colors
+        elif isinstance(plot_centroids, str):
+            plot_centroids = list(plot_centroids)
+    else:
+        plot_centroids = []
+
+    # collect all colors
     colors += [c for c in plot_centroids if c not in colors]
     colors = list(dict.fromkeys(colors))
-    logging.info(f"Configured colors:\n{pformat(colors)}")
+    logger.info(f"Configured colors:\n{pformat(colors)}")
 
     # Separate gene colors from obs colors
     gene_colors = [c for c in colors if c not in obs_columns]
@@ -421,16 +508,16 @@ def embedding(
 
     # Filter obs colors: must exist and have more than one unique value
     dropped_colors = [c for c in colors if c not in obs_columns or adata.obs[c].nunique() <= 1]
-    if warn_on_drop and dropped_colors:
-        logging.warning(
+    if dropped_colors:
+        logger.warning(
             f"The following colors were dropped because they are not in obs or have <=1 unique value: {dropped_colors}"
         )
     colors = [c for c in colors if c in obs_columns and adata.obs[c].nunique() > 1]
-    logging.info(f"Colors from obs after filtering:\n{pformat(colors)}")
+    logger.info(f"Colors from obs after filtering:\n{pformat(colors)}")
 
     obs = adata.obs[colors].copy()  # full annotation needed for legend
     if not inplace or adata.is_view:
-        logging.info("Convert view to copy...")
+        logger.info("Convert view to copy...")
         adata = adata.copy()
 
     # Resolve min_cells_per_category threshold
@@ -444,11 +531,9 @@ def embedding(
         # remove rare categories
         value_counts = column.value_counts(dropna=False)
         rare = value_counts[value_counts <= min_cells_per_category].index
-        if warn_on_drop and len(rare) > 0:
-            logging.warning(f"In color '{col}', the following rare categories were dropped: {list(rare)}")
+        if len(rare) > 0:
+            logger.warning(f"In color '{col}', the following rare categories were dropped: {list(rare)}")
         adata.obs[col] = column.cat.remove_categories(rare)
-
-        print(adata.shape)
 
         # handle category ordering if specified
         order = None
@@ -468,11 +553,11 @@ def embedding(
             adata.obs[col] = adata.obs[col].cat.reorder_categories(existing_order + missing)
 
     if not colors:
-        logging.info("No valid colors, skip...")
+        logger.info("No valid colors, skip...")
         colors = [None]
 
     # Remove embedding outliers
-    logging.info("Remove outliers...")
+    logger.info("Remove outliers...")
     adata = remove_outliers(adata, "max", factor=outlier_factor, rep=basis, copy=False)
     adata = remove_outliers(adata, "min", factor=outlier_factor, rep=basis, copy=False)
 
@@ -488,18 +573,17 @@ def embedding(
         elif isinstance(downsample, int) and downsample > 1 and adata.n_obs > downsample:
             adata = sample(adata, n=downsample, stratify=stratify_col, copy=False)
         # else: ignore if not valid
-    print("after downsample", adata.shape)
 
     if adata.is_view:
-        logging.info("Convert view to copy...")
+        logger.info("Convert view to copy...")
         adata = adata.copy()
 
     # Subset to requested genes, or drop X/var if no genes needed
     if gene_colors:
-        logging.info(f"Subset to {len(gene_colors)} requested genes...")
+        logger.info(f"Subset to {len(gene_colors)} requested genes...")
         adata = adata[:, adata.var_names.isin(gene_colors)]
         adata = dask_compute(adata, layers="X")
-        logging.info(str(adata.var))
+        logger.info(str(adata.var))
     else:
         del adata.X
         del adata.var
@@ -509,10 +593,10 @@ def embedding(
     size = kwargs.pop("size", default_size) or default_size
     kwargs["size"] = min(200, max(default_size, size))
 
-    logging.info("Parameters:\n" + pformat(kwargs))
+    logger.info("Parameters:\n" + pformat(kwargs))
 
     # Plot obs colors in parallel
-    list(
+    color_results = list(
         tqdm(
             Parallel(return_as="generator", backend="threading", n_jobs=n_jobs)(
                 delayed(_plot_color_axis)(
@@ -522,13 +606,19 @@ def embedding(
                     obs=obs,
                     annotate_legend=annotate_legend,
                     plot_centroids=col in plot_centroids,
+                    luminance_threshold=luminance_threshold,
                     bold_labels=bold_labels,
                     title=title,
                     file_name=col,
                     dpi=dpi,
                     output_dir=output_dir,
+                    file_prefix=file_prefix,
+                    file_type=file_type,
                     figsize=figsize,
                     adjust_text_kwargs=adjust_text_kwargs,
+                    verbose=verbose,
+                    return_annotated_labels=return_annotated_labels,
+                    show=show,
                     **kwargs,
                 )
                 for col in colors
@@ -538,6 +628,15 @@ def embedding(
             miniters=1,
         )
     )
+
+    # Propagate scanpy's computed categorical colors back onto the caller's adata,
+    # since plotting above ran on a copy/subset that is discarded after this call.
+    for col in colors:
+        if col is None:
+            continue
+        uns_key = f"{col}_colors"
+        if uns_key in adata.uns:
+            original_adata.uns[uns_key] = adata.uns[uns_key]
 
     # Chunk genes and plot each group in parallel
     gene_groups = {
@@ -560,7 +659,11 @@ def embedding(
                         file_name=group_title,
                         dpi=dpi,
                         output_dir=output_dir,
+                        file_prefix=file_prefix,
+                        file_type=file_type,
                         figsize=figsize,
+                        return_annotated_labels=False,
+                        show=show,
                         **kwargs,
                     )
                     for group_title, group_color in gene_groups.items()
@@ -570,3 +673,6 @@ def embedding(
                 miniters=1,
             )
         )
+
+    if return_annotated_labels:
+        return {color: labels for color, labels in color_results if labels is not None}

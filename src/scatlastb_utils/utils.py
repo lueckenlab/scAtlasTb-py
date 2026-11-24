@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import types
 from contextlib import nullcontext
+from functools import wraps
 
 import anndata as ad
 import numpy as np
@@ -254,3 +255,26 @@ def ensure_dense(adata: ad.AnnData, layers: [str, list] = None, **kwargs):
         return matrix
 
     return apply_layers(adata, func=to_dense, layers=layers, **kwargs)
+
+
+def handle_verbosity(func):
+    """Decorator to silence the logger for the function's module when `verbose=False`.
+
+    Usage: decorate functions that accept a `verbose` keyword argument (default True).
+    When called with `verbose=False` the decorator will temporarily disable the
+    module-level logger for the duration of the call.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        verbose = kwargs.get("verbose", True)
+        target_logger = logging.getLogger(func.__module__)
+        old_disabled = target_logger.disabled
+        if not verbose:
+            target_logger.disabled = True
+        try:
+            return func(*args, **kwargs)
+        finally:
+            target_logger.disabled = old_disabled
+
+    return wrapper
